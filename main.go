@@ -3,10 +3,11 @@ package main
 import (
 	"fmt"
 	"github.com/Gumkle/consoler/consoler"
-	"github.com/PuerkitoBio/goquery"
+	"golang.org/x/net/html"
 	"io"
 	"io/ioutil"
 	"net/http"
+	"sync"
 	"time"
 )
 
@@ -24,7 +25,7 @@ type ResponseDetails struct {
 
 type Utilities struct {
 	logger        *consoler.Logger
-	response_sink chan ResponseDetails
+	response_sink chan *http.Response
 	link_sink chan string
 	books_sink chan Book
 	http_client *http.Client
@@ -33,7 +34,7 @@ type Utilities struct {
 func main() {
 	utilities := Utilities{
 		consoler.NewLogger(),
-		make(chan ResponseDetails, 5),
+		make(chan *http.Response, 5),
 		make(chan string),
 		make(chan Book),
 		&http.Client{
@@ -76,16 +77,8 @@ func connectToSite(site string, utilities Utilities) {
 		utilities.logger.PrintError(fmt.Sprintf("Połączenie nieudane: %s \n %s", site, err))
 		return
 	}
-	responseDetails, err := getResponseDetails(response)
-	if err != nil {
-		utilities.logger.PrintError("Nie udało się otworzyć treści strony")
-	}
-	err = response.Body.Close()
-	if err != nil {
-		utilities.logger.PrintError("Nie udało się zamknąć połączenia ze stroną")
-	}
 	tasklog.SetDone()
-	utilities.response_sink <- responseDetails
+	utilities.response_sink <- response
 	return
 }
 
@@ -101,52 +94,53 @@ func getResponseDetails(response *http.Response) (ResponseDetails, error) {
 func parseContent(utilities Utilities) {
 	for {
 		response := <-utilities.response_sink
-		utilities.logger.PrintInfo(fmt.Sprintf("Rozpoczynanie parsowania danych dla %s", response.address))
-		tasklog := utilities.logger.NewTask(fmt.Sprintf("Parsowanie danych z %s", response.address))
-		linksDone := make(chan bool)
-		booksDone := make(chan bool)
-		go searchForLinks(response, utilities, linksDone)
-		go searchForBookDetails(response, utilities, booksDone)
-		var linksSuccessful, booksSuccessful bool
-		select {
-			case status := <- linksDone:
-				if !status {
-					tasklog.SetFailed()
-					break
-				}
-				linksSuccessful = status
-			case status := <- booksDone:
-				if !status {
-					tasklog.SetFailed()
-					break
-				}
-				booksSuccessful = status
+		responseDetails, err := getResponseDetails(response)
+		if err != nil {
+			utilities.logger.PrintError("Nie udało się otworzyć treści strony")
 		}
-		if linksSuccessful && booksSuccessful {
+		utilities.logger.PrintInfo(fmt.Sprintf("Rozpoczynanie parsowania danych dla %s", responseDetails.address))
+		tasklog := utilities.logger.NewTask(fmt.Sprintf("Parsowanie danych z %s", responseDetails.address))
+		linksSuccessful := make(chan bool)
+		booksSuccessful := make(chan bool)
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go searchForLinks(response, utilities, linksSuccessful, &wg)
+		go searchForBookDetails(response, utilities, booksSuccessful, &wg)
+		wg.Wait()
+		if <-linksSuccessful && <-booksSuccessful {
+			err = response.Body.Close()
+			if err != nil {
+				utilities.logger.PrintError("Nie udało się zamknąć połączenia ze stroną")
+			}
 			tasklog.SetDone()
+		} else {
+			tasklog.SetFailed()
 		}
 	}
 }
 
-func searchForLinks(response ResponseDetails, utilities Utilities, done chan bool) {
-	document, err := goquery.NewDocumentFromReader(response.reader)
-	if err != nil {
-		done <- false
-		utilities.logger.PrintError("Parsowanie dokumentu goquery nie udało się")
-		return
+func searchForLinks(response *http.Response, utilities Utilities, done chan bool, s *sync.WaitGroup) {
+	defer s.Done()
+	z := html.NewTokenizer(response.Body)
+	for {
+		z.Next()
+		fmt.Println(z.Err())
 	}
-	document.Find("a").Each(func(i int, selection *goquery.Selection) {
-		href, exists := selection.Attr("href")
-		if exists {
-			utilities.logger.PrintInfo(fmt.Sprintf("Znaleziony link: %s", href))
-			utilities.link_sink <- href
-		}
-	})
+	//if err != nil {
+	//	done <- false
+	//	utilities.logger.PrintError(fmt.Sprintf("%s", err.Error()))
+	//	return
+	//}
+	//if exists {
+	//	utilities.logger.PrintInfo(fmt.Sprintf("Znaleziony link: %s", href))
+	//	utilities.link_sink <- href
+	//}
 	done <- true
 }
 
-func searchForBookDetails(details ResponseDetails, utilities Utilities, done chan bool) {
-
+func searchForBookDetails(details *http.Response, utilities Utilities, done chan bool, s *sync.WaitGroup) {
+	defer s.Done()
+	done<-true
 }
 
 func saveData(utilities Utilities) {
