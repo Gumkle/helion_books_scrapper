@@ -2,115 +2,91 @@ package main
 
 import (
 	"fmt"
-	"github.com/Gumkle/consoler/consoler"
+	"github.com/Gumkle/helion_price_scrapper/client"
+	"github.com/Gumkle/helion_price_scrapper/datatypes"
+	"github.com/Gumkle/helion_price_scrapper/logger"
+	"github.com/Gumkle/helion_price_scrapper/sinks"
 	"golang.org/x/net/html"
-	"io"
 	"io/ioutil"
 	"net/http"
 	"sync"
-	"time"
 )
 
-type Book struct  {
-	title string
-	price float32
-	site string
-}
-
-type ResponseDetails struct {
-	address string
-	content string
-	reader io.Reader
-}
-
-type Utilities struct {
-	logger        *consoler.Logger
-	response_sink chan *http.Response
-	link_sink chan string
-	books_sink chan Book
-	http_client *http.Client
-}
-
 func main() {
-	utilities := Utilities{
-		consoler.NewLogger(),
-		make(chan *http.Response, 5),
-		make(chan string),
-		make(chan Book),
-		&http.Client{
-			Timeout: 30 * time.Second,
-		},
-	}
-	go initials(utilities)
-	go distributeConnections(utilities)
-	go parseContent(utilities)
-	go saveData(utilities)
+
+	logger.InitLogger()
+	sinks.InitSinks()
+	client.InitClient()
+	go initials()
+	go distributeConnections()
+	go parseContent()
+	go saveData()
 	var input string
 	fmt.Scanln(&input)
 }
 
-func initials(utilities Utilities) {
-	utilities.link_sink <- "https://helion.pl/kategorie/ksiazki"
+func initials() {
+	sinks.Links <- "https://helion.pl/kategorie/ksiazki"
 }
 
-func distributeConnections(utilities Utilities) {
+func distributeConnections() {
 	for {
-		link := <-utilities.link_sink
-		utilities.logger.PrintInfo(fmt.Sprintf("Scrappowanie: %s", link))
-		go connectToSite(link, utilities)
+		link := <-sinks.Links
+		logger.Get().PrintInfo(fmt.Sprintf("Scrappowanie: %s", link))
+		go connectToSite(link)
 	}
 }
 
-func connectToSite(site string, utilities Utilities) {
-	tasklog := utilities.logger.NewTask(fmt.Sprintf("Łączenie z %s", site))
+func connectToSite(site string) {
+	tasklog := logger.Get().NewTask(fmt.Sprintf("Łączenie z %s", site))
 	request, err := http.NewRequest("GET", site,nil)
 	if err != nil {
 		tasklog.SetFailed()
-		utilities.logger.PrintError("Niepoprawna konfiguracja requesta!")
+		logger.Get().PrintError("Niepoprawna konfiguracja requesta!")
 		return
 	}
 	request.Header.Set("Accept-Charset", "utf-8")
 
-	response, err := utilities.http_client.Do(request)
+	response, err := client.Get().Do(request)
 	if err != nil {
 		tasklog.SetFailed()
-		utilities.logger.PrintError(fmt.Sprintf("Połączenie nieudane: %s \n %s", site, err))
+		logger.Get().PrintError(fmt.Sprintf("Połączenie nieudane: %s \n %s", site, err))
 		return
 	}
 	tasklog.SetDone()
-	utilities.response_sink <- response
+	sinks.Responses <- response
 	return
 }
 
-func getResponseDetails(response *http.Response) (ResponseDetails, error) {
+func getResponseDetails(response *http.Response) (datatypes.ResponseDetails, error) {
 	url := response.Request.URL.Scheme + "://" + response.Request.URL.Host + response.Request.URL.Path
 	dataInBytes, err := ioutil.ReadAll(response.Body)
 	if err != nil {
-		return ResponseDetails{"", "", nil}, err
+		return datatypes.ResponseDetails{"", "", nil}, err
 	}
-	return ResponseDetails{url, string(dataInBytes), response.Body}, nil
+	return datatypes.ResponseDetails{url, string(dataInBytes), response.Body}, nil
 }
 
-func parseContent(utilities Utilities) {
+func parseContent() {
 	for {
-		response := <-utilities.response_sink
+		response := <-sinks.Responses
 		responseDetails, err := getResponseDetails(response)
 		if err != nil {
-			utilities.logger.PrintError("Nie udało się otworzyć treści strony")
+			logger.Get().PrintError("Nie udało się otworzyć treści strony")
 		}
-		utilities.logger.PrintInfo(fmt.Sprintf("Rozpoczynanie parsowania danych dla %s", responseDetails.address))
-		tasklog := utilities.logger.NewTask(fmt.Sprintf("Parsowanie danych z %s", responseDetails.address))
+		logger.Get().PrintInfo(fmt.Sprintf("Rozpoczynanie parsowania danych dla %s", responseDetails.Address))
+		tasklog := logger.Get().NewTask(fmt.Sprintf("Parsowanie danych z %s", responseDetails.Address))
 		linksSuccessful := make(chan bool)
 		booksSuccessful := make(chan bool)
 		var wg sync.WaitGroup
 		wg.Add(2)
-		go searchForLinks(response, utilities, linksSuccessful, &wg)
-		go searchForBookDetails(response, utilities, booksSuccessful, &wg)
+		go searchForLinks(response, linksSuccessful, &wg)
+		go searchForBookDetails(response, booksSuccessful, &wg)
 		wg.Wait()
 		if <-linksSuccessful && <-booksSuccessful {
 			err = response.Body.Close()
 			if err != nil {
-				utilities.logger.PrintError("Nie udało się zamknąć połączenia ze stroną")
+				logger.Get().PrintError("Nie udało się zamknąć połączenia ze stroną")
 			}
 			tasklog.SetDone()
 		} else {
@@ -119,7 +95,7 @@ func parseContent(utilities Utilities) {
 	}
 }
 
-func searchForLinks(response *http.Response, utilities Utilities, done chan bool, s *sync.WaitGroup) {
+func searchForLinks(response *http.Response, done chan bool, s *sync.WaitGroup) {
 	defer s.Done()
 	z := html.NewTokenizer(response.Body)
 	for {
@@ -128,21 +104,21 @@ func searchForLinks(response *http.Response, utilities Utilities, done chan bool
 	}
 	//if err != nil {
 	//	done <- false
-	//	utilities.logger.PrintError(fmt.Sprintf("%s", err.Error()))
+	//	logger.Get().PrintError(fmt.Sprintf("%s", err.Error()))
 	//	return
 	//}
 	//if exists {
-	//	utilities.logger.PrintInfo(fmt.Sprintf("Znaleziony link: %s", href))
-	//	utilities.link_sink <- href
+	//	logger.Get().PrintInfo(fmt.Sprintf("Znaleziony link: %s", href))
+	//	sinks.Links <- href
 	//}
 	done <- true
 }
 
-func searchForBookDetails(details *http.Response, utilities Utilities, done chan bool, s *sync.WaitGroup) {
+func searchForBookDetails(details *http.Response, done chan bool, s *sync.WaitGroup) {
 	defer s.Done()
 	done<-true
 }
 
-func saveData(utilities Utilities) {
+func saveData() {
 
 }
